@@ -530,7 +530,7 @@ def plot_points_by_description(df_match, player_name):
     ax.set_title(f"{player_name}: Won and Lost Points by Description", fontsize=16, fontweight="bold")
     ax.set_ylim(0, ymax * 1.5 + label_offset)
     ax.margins(x=0.02)
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left",fontsize = 15)
     fig.tight_layout()
     return fig
 
