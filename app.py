@@ -13,6 +13,7 @@ BASE_POINT_DESCRIPTIONS = [
     "volley error",
     "forehand winner",
     "backhand winner",
+    "unknown",
 ]
 
 SERVE_RESULT_OPTIONS = ["first_serve", "second_serve", "ace", "double_fault"]
@@ -468,16 +469,13 @@ def plot_dominance(df_match, player_A_name, player_B_name):
 
 def plot_points_by_description(df_match, player_name):
     df = df_match.copy()
-    df["description"] = df["description"].fillna("Unknown")
+    df["description"] = df["description"].fillna("unknown")
+    df = df[df["description"].str.lower() != "unknown"].copy()
 
     won_counts = df[df["pointscorer"] == player_name]["description"].value_counts()
     lost_counts = df[df["pointscorer"] != player_name]["description"].value_counts()
 
-    all_descriptions = sorted(
-        set(won_counts.index).union(set(lost_counts.index)),
-        key=lambda x: won_counts.get(x, 0) + lost_counts.get(x, 0),
-        reverse=True,
-    )
+    all_descriptions = list(set(won_counts.index).union(set(lost_counts.index)))
 
     if not all_descriptions:
         fig, ax = plt.subplots(figsize=(12, 4), dpi=170)
@@ -486,38 +484,53 @@ def plot_points_by_description(df_match, player_name):
         fig.tight_layout()
         return fig
 
-    won_values = np.array([won_counts.get(desc, 0) for desc in all_descriptions], dtype=float)
-    lost_values = np.array([lost_counts.get(desc, 0) for desc in all_descriptions], dtype=float)
-    labels = [desc.replace("_", " ").title() for desc in all_descriptions]
-    y = np.arange(len(labels))
+    plot_df = pd.DataFrame({
+        "description": all_descriptions,
+        "won": [int(won_counts.get(desc, 0)) for desc in all_descriptions],
+        "lost": [int(lost_counts.get(desc, 0)) for desc in all_descriptions],
+    })
+    plot_df["sort_score"] = plot_df["won"] - plot_df["lost"]
+    plot_df["total"] = plot_df["won"] + plot_df["lost"]
+    plot_df = plot_df.sort_values(
+        by=["sort_score", "won", "total", "description"],
+        ascending=[False, False, False, True],
+    ).reset_index(drop=True)
 
-    fig_height = max(5.5, len(labels) * 0.6)
-    fig, ax = plt.subplots(figsize=(13, fig_height), dpi=170)
-    ax.barh(y, -lost_values, height=0.62, color="crimson", label="Lost points")
-    ax.barh(y, won_values, height=0.62, color="#003366", label="Won points")
-    ax.axvline(0, color="gray", linewidth=1)
+    labels = [desc.replace("_", " ").title() for desc in plot_df["description"]]
+    won_values = plot_df["won"].to_numpy(dtype=float)
+    lost_values = plot_df["lost"].to_numpy(dtype=float)
+    x = np.arange(len(labels))
+    width = 0.44
 
-    max_value = max(np.max(won_values) if len(won_values) else 0, np.max(lost_values) if len(lost_values) else 0, 1)
-    offset = max_value * 0.06
+    fig_width = max(13, len(labels) * 1.15)
+    fig, ax = plt.subplots(figsize=(fig_width, 6.8), dpi=170)
+    bars_won = ax.bar(x - width / 2, won_values, width=width, color="#1696d2", edgecolor="black", linewidth=0.8, label="Won points")
+    bars_lost = ax.bar(x + width / 2, lost_values, width=width, color="#ff1122", edgecolor="black", linewidth=0.8, label="Lost points")
 
-    for i, label in enumerate(labels):
-        ax.text(0, i, label, ha="center", va="center", fontsize=10,
-                bbox=dict(facecolor="white", edgecolor="none", boxstyle="square,pad=0.25"), zorder=3)
+    ymax = max(np.max(won_values) if len(won_values) else 0, np.max(lost_values) if len(lost_values) else 0, 1)
+    label_offset = max(0.08, ymax * 0.025)
 
-    for i, value in enumerate(lost_values):
-        if value > 0:
-            ax.text(-value - offset, i, str(int(value)), ha="right", va="center", fontsize=10)
-    for i, value in enumerate(won_values):
-        if value > 0:
-            ax.text(value + offset, i, str(int(value)), ha="left", va="center", fontsize=10)
+    for bars in [bars_won, bars_lost]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    height + label_offset,
+                    f"{int(height)}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                )
 
-    ax.set_yticks([])
-    ax.set_xticks([])
-    ax.set_xlim(-(max_value * 1.55), max_value * 1.55)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=10)
+    ax.set_ylabel("Frequency", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Description", fontsize=11, fontweight="bold")
     ax.set_title(f"{player_name}: Won and Lost Points by Description", fontsize=16, fontweight="bold")
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.legend(loc="lower right")
+    ax.set_ylim(0, ymax * 1.12 + label_offset)
+    ax.margins(x=0.02)
+    ax.legend(loc="upper left")
     fig.tight_layout()
     return fig
 
@@ -841,24 +854,31 @@ def main():
             st.write("**Game dominance source data**")
             st.dataframe(dominance_table, use_container_width=True)
 
+            description_df = df_match.copy()
+            description_df["description"] = description_df["description"].fillna("unknown")
+            description_df = description_df[description_df["description"].str.lower() != "unknown"].copy()
+
             description_table = pd.DataFrame({
-                "Description": sorted(set(df_match["description"].fillna("Unknown"))),
+                "Description": sorted(set(description_df["description"]))
             })
             description_table[f"{player_A} won"] = description_table["Description"].map(
-                df_match[df_match["pointscorer"] == player_A]["description"].fillna("Unknown").value_counts()
+                description_df[description_df["pointscorer"] == player_A]["description"].value_counts()
             ).fillna(0).astype(int)
             description_table[f"{player_A} lost"] = description_table["Description"].map(
-                df_match[df_match["pointscorer"] != player_A]["description"].fillna("Unknown").value_counts()
+                description_df[description_df["pointscorer"] != player_A]["description"].value_counts()
             ).fillna(0).astype(int)
             description_table[f"{player_B} won"] = description_table["Description"].map(
-                df_match[df_match["pointscorer"] == player_B]["description"].fillna("Unknown").value_counts()
+                description_df[description_df["pointscorer"] == player_B]["description"].value_counts()
             ).fillna(0).astype(int)
             description_table[f"{player_B} lost"] = description_table["Description"].map(
-                df_match[df_match["pointscorer"] != player_B]["description"].fillna("Unknown").value_counts()
+                description_df[description_df["pointscorer"] != player_B]["description"].value_counts()
             ).fillna(0).astype(int)
 
             st.write("**Point description source data**")
-            st.dataframe(description_table, use_container_width=True)
+            if len(description_table):
+                st.dataframe(description_table, use_container_width=True)
+            else:
+                st.info("No non-unknown point descriptions recorded yet.")
 
         st.subheader("Recorded points")
         st.dataframe(df_match, use_container_width=True)
