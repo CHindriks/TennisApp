@@ -72,7 +72,11 @@ def valid_serve_results(server, scorer, description):
 
     if scorer == server:
         return ["first_serve", "second_serve"]
-    return ["first_serve", "second_serve", "double_fault"]
+    return ["first_serve", "second_serve"]
+
+
+def pick_valid(current_value, valid_options):
+    return current_value if current_value in valid_options else valid_options[0]
 
 
 def render_figure_download(fig, filename_base):
@@ -711,19 +715,28 @@ def main():
     else:
         st.write(f"**Server:** {server_now}")
 
-    with st.form("point_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            scorer = st.selectbox("Who won the point?", [player_A, player_B])
-        valid_descriptions = valid_point_descriptions(server_now, scorer)
-        with c2:
-            description = st.selectbox("Point description", valid_descriptions)
-        valid_serves = valid_serve_results(server_now, scorer, description)
-        with c3:
-            serve_result = st.selectbox("Serve result", valid_serves)
-        submitted = st.form_submit_button("Add point")
+    st.subheader("Add point")
+    c1, c2, c3 = st.columns(3)
 
-    if submitted:
+    scorer_options = [player_A, player_B]
+    current_scorer = st.session_state.get("ui_scorer", scorer_options[0])
+    st.session_state.ui_scorer = pick_valid(current_scorer, scorer_options)
+    with c1:
+        scorer = st.selectbox("Who won the point?", scorer_options, key="ui_scorer")
+
+    valid_descriptions = valid_point_descriptions(server_now, scorer)
+    current_description = st.session_state.get("ui_description", valid_descriptions[0])
+    st.session_state.ui_description = pick_valid(current_description, valid_descriptions)
+    with c2:
+        description = st.selectbox("Point description", valid_descriptions, key="ui_description")
+
+    valid_serves = valid_serve_results(server_now, scorer, description)
+    current_serve = st.session_state.get("ui_serve_result", valid_serves[0])
+    st.session_state.ui_serve_result = pick_valid(current_serve, valid_serves)
+    with c3:
+        serve_result = st.selectbox("Serve result", valid_serves, key="ui_serve_result")
+
+    if st.button("Add point"):
         add_point(scorer, description, serve_result)
         st.rerun()
 
