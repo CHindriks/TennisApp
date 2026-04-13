@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-POINT_DESCRIPTIONS = [
+BASE_POINT_DESCRIPTIONS = [
     "forced error forehand",
     "forced error backhand",
     "unforced error forehand",
@@ -13,9 +13,9 @@ POINT_DESCRIPTIONS = [
     "volley error",
     "forehand winner",
     "backhand winner",
-    "ace",
-    "double fault",
 ]
+
+SERVE_RESULT_OPTIONS = ["first_serve", "second_serve", "ace", "double_fault"]
 
 
 def tennis_score(pA, pB):
@@ -40,6 +40,55 @@ def tiebreak_server_for_point(first_server, player_A, player_B, point_index):
 
 def other_player(player, player_A, player_B):
     return player_B if player == player_A else player_A
+
+
+def current_server_name():
+    player_A = st.session_state.player_A
+    player_B = st.session_state.player_B
+    if st.session_state.tiebreak_status:
+        return tiebreak_server_for_point(
+            st.session_state.tiebreak_first_server,
+            player_A,
+            player_B,
+            st.session_state.tiebreak_point_index,
+        )
+    return st.session_state.current_server
+
+
+def valid_point_descriptions(server, scorer):
+    descriptions = list(BASE_POINT_DESCRIPTIONS)
+    if scorer == server:
+        descriptions.append("ace")
+    else:
+        descriptions.append("double fault")
+    return descriptions
+
+
+def valid_serve_results(server, scorer, description):
+    if description == "ace":
+        return ["ace"]
+    if description == "double fault":
+        return ["double_fault"]
+
+    if scorer == server:
+        return ["first_serve", "second_serve"]
+    return ["first_serve", "second_serve"]
+
+
+def pick_valid(current_value, valid_options):
+    return current_value if current_value in valid_options else valid_options[0]
+
+
+def render_figure_download(fig, filename_base):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button(
+        f"Download {filename_base}.png",
+        data=buf.getvalue(),
+        file_name=f"{filename_base}.png",
+        mime="image/png",
+    )
 
 
 def build_match_dataframe(df, player_A, player_B, match_type="singles"):
@@ -239,26 +288,25 @@ def generate_match_stats(df_match, player_A_name, player_B_name):
 
         for _, row in game.iterrows():
             is_break_point = (p_receiver >= 3) and (p_receiver - p_server >= 1)
+            scorer = name_to_key[row["pointscorer"]]
+
             if is_break_point:
                 break_points_faced[server] += 1
                 break_points_chances[receiver] += 1
-
-            scorer = name_to_key[row["pointscorer"]]
-            if scorer == server:
-                p_server += 1
-                if is_break_point:
+                if scorer == server:
                     break_points_saved[server] += 1
-            else:
-                p_receiver += 1
-                if is_break_point:
+                else:
                     break_points_converted[receiver] += 1
 
-            game_over = False
-            if p_server >= 4 and p_server - p_receiver >= 2:
-                game_over = True
-            elif p_receiver >= 4 and p_receiver - p_server >= 2:
-                game_over = True
+            if scorer == server:
+                p_server += 1
+            else:
+                p_receiver += 1
 
+            game_over = (
+                (p_server >= 4 and p_server - p_receiver >= 2)
+                or (p_receiver >= 4 and p_receiver - p_server >= 2)
+            )
             if game_over:
                 break
 
@@ -304,7 +352,7 @@ def plot_stats_rotated(stats_df):
     norm_B = values_B / max_per_row
     y = np.arange(len(labels))
 
-    fig, ax = plt.subplots(figsize=(12, 7.5))
+    fig, ax = plt.subplots(figsize=(13, 9), dpi=170)
     ax.barh(y, -norm_A, height=0.62, color="crimson")
     ax.barh(y, norm_B, height=0.62, color="#003366")
     ax.axvline(0, linewidth=1)
@@ -312,7 +360,7 @@ def plot_stats_rotated(stats_df):
     for i, label in enumerate(labels):
         ax.text(
             0, i, label,
-            ha="center", va="center", fontsize=10,
+            ha="center", va="center", fontsize=11,
             bbox=dict(facecolor="white", edgecolor="none", boxstyle="square,pad=0.25"),
             zorder=3,
         )
@@ -328,16 +376,16 @@ def plot_stats_rotated(stats_df):
         if raw != 0:
             ax.text(norm + offset, i, fmt(raw), ha="left", va="center", fontsize=10)
 
-    ax.text(-0.78, -0.95, df_plot.columns[0], ha="center", va="bottom", fontsize=13, fontweight="bold")
-    ax.text(0.78, -0.95, df_plot.columns[1], ha="center", va="bottom", fontsize=13, fontweight="bold")
+    ax.text(-0.78, -0.95, df_plot.columns[0], ha="center", va="bottom", fontsize=14, fontweight="bold")
+    ax.text(0.78, -0.95, df_plot.columns[1], ha="center", va="bottom", fontsize=14, fontweight="bold")
     ax.set_yticks([])
     ax.set_xticks([])
     ax.set_xlim(-1.45, 1.45)
     ax.set_ylim(len(labels) - 0.3, -0.6)
-    ax.set_title("Match Summary", fontsize=17, fontweight="bold")
+    ax.set_title("Match Summary", fontsize=18, fontweight="bold")
     for spine in ax.spines.values():
         spine.set_visible(False)
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -389,7 +437,7 @@ def plot_dominance(df_match, player_A_name, player_B_name):
         })
         current_x += 1
 
-    fig, ax = plt.subplots(figsize=(max(10, len(x) * 0.55), 5.5))
+    fig, ax = plt.subplots(figsize=(max(12, len(x) * 0.85), 7), dpi=170)
     for i, s in enumerate(set_ranges):
         left = s["start"] - 0.5
         right = s["end"] + 0.5
@@ -401,18 +449,19 @@ def plot_dominance(df_match, player_A_name, player_B_name):
             text = f"Set {s['set']} ({s['games_A']}-{s['games_B']}, TB {s['tb_A']}-{s['tb_B']})"
         else:
             text = f"Set {s['set']} ({s['games_A']}-{s['games_B']})"
-        ax.text(left + 0.1, 0.98, text, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=10, fontweight="bold")
+        ax.text(left + 0.1, 0.98, text, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=11, fontweight="bold")
 
     ax.axhline(0, color="gray")
     ax.bar(x, values, color=colors)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels)
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.tick_params(axis="y", labelsize=10)
     ax.set_ylim(-1.1, 1.25)
     ax.set_xlim(-1, max(x) + 1 if x else 1)
-    ax.set_xlabel("Game")
-    ax.set_ylabel("Game dominance")
-    ax.set_title("Tennis Game Dominance by Set")
-    plt.tight_layout()
+    ax.set_xlabel("Game", fontsize=11)
+    ax.set_ylabel("Game dominance", fontsize=11)
+    ax.set_title("Tennis Game Dominance by Set", fontsize=17)
+    fig.tight_layout()
     return fig
 
 
@@ -421,6 +470,7 @@ def reset_match_state():
     st.session_state.finished = False
     st.session_state.rows = []
     st.session_state.current_server = None
+    st.session_state.first_server = None
     st.session_state.set_no = 1
     st.session_state.game_no = 1
     st.session_state.point_no_in_game = 0
@@ -441,6 +491,7 @@ def init_state():
         "finished": False,
         "rows": [],
         "current_server": None,
+        "first_server": None,
         "set_no": 1,
         "game_no": 1,
         "point_no_in_game": 0,
@@ -584,6 +635,19 @@ def add_point(scorer, description, serve_result):
             st.session_state.games_B = 0
 
 
+def rebuild_state_from_rows(saved_rows, player_A, player_B, first_server, match_type):
+    reset_match_state()
+    st.session_state.player_A = player_A
+    st.session_state.player_B = player_B
+    st.session_state.current_server = first_server
+    st.session_state.first_server = first_server
+    st.session_state.match_type = match_type
+    st.session_state.match_started = True
+    for row in saved_rows:
+        sr = row["serve_result_player_A"] if row["serve_result_player_A"] else row["serve_result_player_B"]
+        add_point(row["pointscorer"], row["description"], sr)
+
+
 def main():
     st.set_page_config(page_title="Tennis Match Stats", layout="wide")
     init_state()
@@ -605,6 +669,7 @@ def main():
                 st.session_state.player_A = player_A
                 st.session_state.player_B = player_B
                 st.session_state.current_server = first_server
+                st.session_state.first_server = first_server
                 st.session_state.match_type = match_type
                 st.session_state.match_started = True
                 st.rerun()
@@ -613,25 +678,9 @@ def main():
                 saved_rows = st.session_state.rows[:-1]
                 player_A_saved = st.session_state.get("player_A", player_A)
                 player_B_saved = st.session_state.get("player_B", player_B)
-                first_server_saved = st.session_state.get("current_server") or first_server
+                first_server_saved = st.session_state.get("first_server") or first_server
                 match_type_saved = st.session_state.get("match_type", match_type)
-                reset_match_state()
-                st.session_state.player_A = player_A_saved
-                st.session_state.player_B = player_B_saved
-                st.session_state.current_server = first_server_saved
-                st.session_state.match_type = match_type_saved
-                st.session_state.match_started = True
-                starter_server = first_server_saved
-                reset_rows = saved_rows
-                reset_match_state()
-                st.session_state.player_A = player_A_saved
-                st.session_state.player_B = player_B_saved
-                st.session_state.current_server = starter_server
-                st.session_state.match_type = match_type_saved
-                st.session_state.match_started = True
-                for row in reset_rows:
-                    sr = row["serve_result_player_A"] if row["serve_result_player_A"] else row["serve_result_player_B"]
-                    add_point(row["pointscorer"], row["description"], sr)
+                rebuild_state_from_rows(saved_rows, player_A_saved, player_B_saved, first_server_saved, match_type_saved)
                 st.rerun()
 
     if not st.session_state.match_started:
@@ -640,6 +689,7 @@ def main():
 
     player_A = st.session_state.player_A
     player_B = st.session_state.player_B
+    server_now = current_server_name()
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -654,36 +704,33 @@ def main():
             st.metric("Current game", f"{player_A} {scoreA} - {scoreB} {player_B}")
 
     if st.session_state.tiebreak_status:
-        server_now = tiebreak_server_for_point(
-            st.session_state.tiebreak_first_server,
-            player_A,
-            player_B,
-            st.session_state.tiebreak_point_index,
-        )
         st.write(f"**Server:** {server_now}  ")
         st.write(f"**Mode:** {st.session_state.tiebreak_status}")
     else:
-        st.write(f"**Server:** {st.session_state.current_server}")
+        st.write(f"**Server:** {server_now}")
 
-    with st.form("point_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            scorer = st.selectbox("Who won the point?", [player_A, player_B])
-        with c2:
-            description = st.selectbox("Point description", POINT_DESCRIPTIONS)
-        with c3:
-            serve_result = st.selectbox(
-                "Serve result",
-                ["first_serve", "second_serve", "ace", "double_fault"],
-                index=2 if description == "ace" else 3 if description == "double fault" else 0,
-            )
-        submitted = st.form_submit_button("Add point")
+    st.subheader("Add point")
+    c1, c2, c3 = st.columns(3)
 
-    if submitted:
-        if description == "ace":
-            serve_result = "ace"
-        elif description == "double fault":
-            serve_result = "double_fault"
+    scorer_options = [player_A, player_B]
+    current_scorer = st.session_state.get("ui_scorer", scorer_options[0])
+    st.session_state.ui_scorer = pick_valid(current_scorer, scorer_options)
+    with c1:
+        scorer = st.selectbox("Who won the point?", scorer_options, key="ui_scorer")
+
+    valid_descriptions = valid_point_descriptions(server_now, scorer)
+    current_description = st.session_state.get("ui_description", valid_descriptions[0])
+    st.session_state.ui_description = pick_valid(current_description, valid_descriptions)
+    with c2:
+        description = st.selectbox("Point description", valid_descriptions, key="ui_description")
+
+    valid_serves = valid_serve_results(server_now, scorer, description)
+    current_serve = st.session_state.get("ui_serve_result", valid_serves[0])
+    st.session_state.ui_serve_result = pick_valid(current_serve, valid_serves)
+    with c3:
+        serve_result = st.selectbox("Serve result", valid_serves, key="ui_serve_result")
+
+    if st.button("Add point"):
         add_point(scorer, description, serve_result)
         st.rerun()
 
@@ -695,11 +742,35 @@ def main():
         st.subheader("Live stats")
         st.dataframe(stats_df, use_container_width=True)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.pyplot(plot_stats_rotated(stats_df))
-        with c2:
-            st.pyplot(plot_dominance(df_match, player_A, player_B))
+        st.subheader("Charts")
+        st.caption("The graphs are now full-width and high-resolution so they are much easier to read on a phone.")
+
+        fig_summary = plot_stats_rotated(stats_df)
+        st.pyplot(fig_summary, use_container_width=True)
+        render_figure_download(fig_summary, "match_summary")
+        plt.close(fig_summary)
+
+        fig_dominance = plot_dominance(df_match, player_A, player_B)
+        st.pyplot(fig_dominance, use_container_width=True)
+        render_figure_download(fig_dominance, "game_dominance")
+        plt.close(fig_dominance)
+
+        with st.expander("Show chart data tables"):
+            st.write("**Match summary values**")
+            st.dataframe(stats_df, use_container_width=True)
+
+            dominance_table = (
+                df_match.groupby(["set_number", "game_number"])
+                .agg(
+                    server=("server", "last"),
+                    points_won_by_A=("pointscorer", lambda x: (x == player_A).sum()),
+                    points_won_by_B=("pointscorer", lambda x: (x == player_B).sum()),
+                    tiebreak_status=("Tiebreak_status", "last"),
+                )
+                .reset_index()
+            )
+            st.write("**Game dominance source data**")
+            st.dataframe(dominance_table, use_container_width=True)
 
         st.subheader("Recorded points")
         st.dataframe(df_match, use_container_width=True)
