@@ -422,7 +422,7 @@ def plot_dominance(df_match, player_A_name, player_B_name):
             x.append(current_x)
             labels.append(str(int(row["game_number"])))
             values.append(row["dominance"])
-            colors.append("forestgreen" if row["dominance"] > 0 else "crimson")
+            colors.append("#003366" if row["dominance"] > 0 else "crimson")
             current_x += 1
         end_x = current_x - 1
         final_row = gset.iloc[-1]
