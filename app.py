@@ -504,8 +504,8 @@ def plot_points_by_description(df_match, player_name):
 
     fig_width = max(13, len(labels) * 1.15)
     fig, ax = plt.subplots(figsize=(fig_width, 6.8), dpi=170)
-    bars_won = ax.bar(x - width / 2, won_values, width=width, color="#1696d2", edgecolor="black", linewidth=0.8, label="Won points")
-    bars_lost = ax.bar(x + width / 2, lost_values, width=width, color="#ff1122", edgecolor="black", linewidth=0.8, label="Lost points")
+    bars_won = ax.bar(x - width / 2, won_values, width=width, color="#003366", edgecolor="black", linewidth=0.8, label="Won points")
+    bars_lost = ax.bar(x + width / 2, lost_values, width=width, color="crimson", edgecolor="black", linewidth=0.8, label="Lost points")
 
     ymax = max(np.max(won_values) if len(won_values) else 0, np.max(lost_values) if len(lost_values) else 0, 1)
     label_offset = max(0.08, ymax * 0.025)
