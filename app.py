@@ -354,7 +354,7 @@ def plot_stats_rotated(stats_df):
     y = np.arange(len(labels))
 
     fig, ax = plt.subplots(figsize=(13, 9), dpi=170)
-    ax.barh(y, -norm_A, height=0.62, color="crimson")
+    ax.barh(y, -norm_A, height=0.62, color="pink")
     ax.barh(y, norm_B, height=0.62, color="#003366")
     ax.axvline(0, linewidth=1)
 
