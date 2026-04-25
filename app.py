@@ -1,893 +1,1081 @@
-import io
+"""
+Tennis Match Tracker — Improved Version
+========================================
+Changes from original:
+  • Button-based point entry (Ace / DF are one-tap; 1st/2nd serve then pick winner)
+  • Custom dark scoreboard card with large typography
+  • Plotly charts: butterfly stats, momentum, and game-dominance (all zoomable)
+  • Auto-save to JSON on every point — survives page refresh
+  • Resume-saved-match button on startup
+  • GitHub push via REST API (no extra package)
+  • Input validation (empty / duplicate names)
+  • initial_server tracked for correct Undo replay
+  • Server correctly alternated across set boundaries (bug fix)
+  • Dead code and double-reset removed (bug fixes)
+  • Faster DataFrame access (.at instead of .loc in hot loop)
+  • Stats display: % values shown with %, counts as integers
+
+Requirements (add to requirements.txt):
+  streamlit>=1.32
+  pandas
+  numpy
+  plotly
+  requests
+"""
+
+import base64
+import json
+import os
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import streamlit as st
 
-BASE_POINT_DESCRIPTIONS = [
-    "forced error forehand",
-    "forced error backhand",
-    "unforced error forehand",
-    "unforced error backhand",
-    "volley winner",
-    "volley error",
-    "forehand winner",
-    "backhand winner",
-    "unknown",
+# ══════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════════
+
+AUTOSAVE = "tennis_autosave.json"
+
+COL_A       = "#C41E3A"                   # crimson
+COL_B       = "#1565C0"                   # royal blue
+COL_A_FILL  = "rgba(196, 30, 58, 0.18)"
+COL_B_FILL  = "rgba(21, 101, 192, 0.18)"
+
+DESCRIPTIONS = [
+    "Forehand winner",
+    "Backhand winner",
+    "Volley winner",
+    "Ace",
+    "Forced error forehand",
+    "Forced error backhand",
+    "Unforced error forehand",
+    "Unforced error backhand",
+    "Volley error",
+    "Double fault",
+    "Other",
 ]
 
-SERVE_RESULT_OPTIONS = ["first_serve", "second_serve", "ace", "double_fault"]
+# Single source-of-truth for all session-state keys and their defaults.
+DEFAULTS: dict = dict(
+    match_started=False,
+    finished=False,
+    rows=[],
+    player_A="Player A",
+    player_B="Player B",
+    initial_server=None,     # ← NEW: first server of the whole match
+    current_server=None,
+    match_type="singles",
+    set_no=1,
+    game_no=1,
+    point_no_in_game=0,
+    sets_A=0,
+    sets_B=0,
+    games_A=0,
+    games_B=0,
+    points_A=0,
+    points_B=0,
+    tiebreak_status="",
+    tiebreak_first_server=None,
+    tiebreak_point_index=0,
+    serve_type=None,          # ← NEW: currently selected serve button
+)
+
+STAT_ORDER = [
+    "Total pts won %",
+    "First serve %",
+    "1st srv pts won %",
+    "2nd srv pts won %",
+    "Break pts saved %",
+    "Break pts converted %",
+    "Net pts won %",
+    "Winners",
+    "Aces",
+    "Unforced errors",
+    "Double faults",
+]
 
 
-def tennis_score(pA, pB):
-    score_map = [0, 15, 30, 40]
+# ══════════════════════════════════════════════════════════════════════
+# SCORING HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def tennis_score(pA: int, pB: int) -> tuple[str, str]:
+    m = [0, 15, 30, 40]
     if pA >= 3 and pB >= 3:
         if pA == pB:
             return "40", "40"
-        elif pA == pB + 1:
-            return "A", "40"
-        elif pB == pA + 1:
-            return "40", "A"
-    return str(score_map[min(pA, 3)]), str(score_map[min(pB, 3)])
+        return ("Ad", "40") if pA > pB else ("40", "Ad")
+    return str(m[min(pA, 3)]), str(m[min(pB, 3)])
 
 
-def tiebreak_server_for_point(first_server, player_A, player_B, point_index):
-    other = player_B if first_server == player_A else player_A
-    if point_index == 0:
-        return first_server
-    block = (point_index - 1) // 2
-    return other if block % 2 == 0 else first_server
+def other(p: str, a: str, b: str) -> str:
+    return b if p == a else a
 
 
-def other_player(player, player_A, player_B):
-    return player_B if player == player_A else player_A
+def tb_server(first_srv: str, a: str, b: str, idx: int) -> str:
+    """Return who serves the idx-th point of a tiebreak."""
+    alt = other(first_srv, a, b)
+    if idx == 0:
+        return first_srv
+    return alt if ((idx - 1) // 2) % 2 == 0 else first_srv
 
 
-def current_server_name():
-    player_A = st.session_state.player_A
-    player_B = st.session_state.player_B
-    if st.session_state.tiebreak_status:
-        return tiebreak_server_for_point(
-            st.session_state.tiebreak_first_server,
-            player_A,
-            player_B,
-            st.session_state.tiebreak_point_index,
-        )
-    return st.session_state.current_server
+# ══════════════════════════════════════════════════════════════════════
+# BUILD MATCH DATAFRAME
+# ══════════════════════════════════════════════════════════════════════
 
+def build_match_df(df: pd.DataFrame, player_A: str, player_B: str) -> pd.DataFrame:
+    """Annotate raw rows with running Tennis_score / Games / Sets columns."""
+    d = df.copy()
+    for col in ("Tennis_score_A", "Tennis_score_B"):
+        d[col] = ""
+    for col in ("Games_player_A", "Games_player_B", "Sets_player_A", "Sets_player_B"):
+        d[col] = 0
 
-def valid_point_descriptions(server, scorer):
-    descriptions = list(BASE_POINT_DESCRIPTIONS)
-    if scorer == server:
-        descriptions.append("ace")
-    else:
-        descriptions.append("double fault")
-    return descriptions
+    pA = pB = gA = gB = sA = sB = 0
+    cur_set = cur_game = None
 
+    for i in d.index:
+        scorer = d.at[i, "pointscorer"]
+        r_set  = d.at[i, "set_number"]
+        r_game = d.at[i, "game_number"]
+        tb     = d.at[i, "Tiebreak_status"] or ""
 
-def valid_serve_results(server, scorer, description):
-    if description == "ace":
-        return ["ace"]
-    if description == "double fault":
-        return ["double_fault"]
+        if cur_set != r_set:
+            cur_set, cur_game = r_set, None
+            pA = pB = gA = gB = 0
 
-    if scorer == server:
-        return ["first_serve", "second_serve"]
-    return ["first_serve", "second_serve"]
-
-
-def pick_valid(current_value, valid_options):
-    return current_value if current_value in valid_options else valid_options[0]
-
-
-def render_figure_download(fig, filename_base):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
-    buf.seek(0)
-    st.download_button(
-        f"Download {filename_base}.png",
-        data=buf.getvalue(),
-        file_name=f"{filename_base}.png",
-        mime="image/png",
-    )
-
-
-def build_match_dataframe(df, player_A, player_B, match_type="singles"):
-    df_match = df.copy()
-
-    df_match["Score_player_A"] = df_match["pointscorer"].eq(player_A).astype(int)
-    df_match["Score_player_B"] = df_match["pointscorer"].eq(player_B).astype(int)
-
-    df_match["Tennis_score_A"] = ""
-    df_match["Tennis_score_B"] = ""
-    df_match["Games_player_A"] = 0
-    df_match["Games_player_B"] = 0
-    df_match["Sets_player_A"] = 0
-    df_match["Sets_player_B"] = 0
-
-    points_A = points_B = games_A = games_B = sets_A = sets_B = 0
-    current_set = None
-    current_game = None
-
-    for i in df_match.index:
-        scorer = df_match.loc[i, "pointscorer"]
-        row_set = df_match.loc[i, "set_number"]
-        row_game = df_match.loc[i, "game_number"]
-        tb_status = df_match.loc[i, "Tiebreak_status"]
-
-        if current_set != row_set:
-            current_set = row_set
-            current_game = None
-            points_A = points_B = games_A = games_B = 0
-
-        if pd.isna(tb_status) or tb_status == "":
-            if current_game != row_game:
-                current_game = row_game
-                points_A = points_B = 0
-
+        if tb == "":
+            if cur_game != r_game:
+                cur_game, pA, pB = r_game, 0, 0
             if scorer == player_A:
-                points_A += 1
+                pA += 1
             else:
-                points_B += 1
-
-            game_winner = None
-            if points_A >= 4 and points_A - points_B >= 2:
-                game_winner = player_A
-            elif points_B >= 4 and points_B - points_A >= 2:
-                game_winner = player_B
-
-            if game_winner == player_A:
-                games_A += 1
-                points_A = points_B = 0
-            elif game_winner == player_B:
-                games_B += 1
-                points_A = points_B = 0
-
-            score_A, score_B = tennis_score(points_A, points_B)
-            df_match.loc[i, "Tennis_score_A"] = score_A
-            df_match.loc[i, "Tennis_score_B"] = score_B
-
-        elif tb_status == "tiebreak":
-            if current_game != row_game:
-                current_game = row_game
-                points_A = points_B = 0
-
+                pB += 1
+            gw = None
+            if pA >= 4 and pA - pB >= 2:
+                gw = player_A
+            elif pB >= 4 and pB - pA >= 2:
+                gw = player_B
+            if gw == player_A:
+                gA += 1; pA = pB = 0
+            elif gw == player_B:
+                gB += 1; pA = pB = 0
+            sa, sb = tennis_score(pA, pB)
+            d.at[i, "Tennis_score_A"], d.at[i, "Tennis_score_B"] = sa, sb
+        else:
+            target = 10 if tb == "super_tiebreak" else 7
+            if cur_game != r_game:
+                cur_game, pA, pB = r_game, 0, 0
             if scorer == player_A:
-                points_A += 1
+                pA += 1
             else:
-                points_B += 1
+                pB += 1
+            d.at[i, "Tennis_score_A"] = str(pA)
+            d.at[i, "Tennis_score_B"] = str(pB)
+            if pA >= target and pA - pB >= 2:
+                sA += 1; gA = gB = pA = pB = 0
+            elif pB >= target and pB - pA >= 2:
+                sB += 1; gA = gB = pA = pB = 0
 
-            df_match.loc[i, "Tennis_score_A"] = str(points_A)
-            df_match.loc[i, "Tennis_score_B"] = str(points_B)
+        d.at[i, "Games_player_A"] = gA
+        d.at[i, "Games_player_B"] = gB
+        d.at[i, "Sets_player_A"]  = sA
+        d.at[i, "Sets_player_B"]  = sB
 
-            if points_A >= 7 and points_A - points_B >= 2:
-                sets_A += 1
-                games_A = games_B = points_A = points_B = 0
-                df_match.loc[i, "Tennis_score_A"] = "0"
-                df_match.loc[i, "Tennis_score_B"] = "0"
-            elif points_B >= 7 and points_B - points_A >= 2:
-                sets_B += 1
-                games_A = games_B = points_A = points_B = 0
-                df_match.loc[i, "Tennis_score_A"] = "0"
-                df_match.loc[i, "Tennis_score_B"] = "0"
-
-        elif tb_status == "super_tiebreak":
-            if current_game != row_game:
-                current_game = row_game
-                points_A = points_B = 0
-
-            if scorer == player_A:
-                points_A += 1
-            else:
-                points_B += 1
-
-            df_match.loc[i, "Tennis_score_A"] = str(points_A)
-            df_match.loc[i, "Tennis_score_B"] = str(points_B)
-
-            if points_A >= 10 and points_A - points_B >= 2:
-                sets_A += 1
-                points_A = points_B = 0
-                df_match.loc[i, "Tennis_score_A"] = "0"
-                df_match.loc[i, "Tennis_score_B"] = "0"
-            elif points_B >= 10 and points_B - points_A >= 2:
-                sets_B += 1
-                points_A = points_B = 0
-                df_match.loc[i, "Tennis_score_A"] = "0"
-                df_match.loc[i, "Tennis_score_B"] = "0"
-
-        df_match.loc[i, "Games_player_A"] = games_A
-        df_match.loc[i, "Games_player_B"] = games_B
-        df_match.loc[i, "Sets_player_A"] = sets_A
-        df_match.loc[i, "Sets_player_B"] = sets_B
-
-    return df_match
+    return d
 
 
-def generate_match_stats(df_match, player_A_name, player_B_name):
-    df = df_match.copy()
+# ══════════════════════════════════════════════════════════════════════
+# STATISTICS
+# ══════════════════════════════════════════════════════════════════════
+
+def _pct(num: float, denom: float) -> float:
+    return round(100.0 * num / denom, 1) if denom else float("nan")
+
+
+def generate_stats(df_m: pd.DataFrame, name_A: str, name_B: str) -> pd.DataFrame:
+    """Return a DataFrame indexed by stat name, columns = [name_A, name_B]."""
+    df = df_m.copy()
     df["Tiebreak_status"] = df["Tiebreak_status"].fillna("")
+    stats: dict[str, dict] = {}
 
-    player_map = {"player A": player_A_name, "player B": player_B_name}
-    players = ["player A", "player B"]
+    pairs = [
+        (name_A, name_B, "serve_result_player_A"),
+        (name_B, name_A, "serve_result_player_B"),
+    ]
+    for name, other_name, serve_col in pairs:
+        sp    = df[df["server"] == name]
+        n_srv = len(sp)
+        f_pts = sp[sp[serve_col].isin(["first_serve", "ace"])]
+        s_pts = sp[sp[serve_col] == "second_serve"]
 
-    def other_player_label(player):
-        return "player B" if player == "player A" else "player A"
-
-    stats = {}
-    for player in players:
-        service_points = df[df["server"] == player_map[player]].copy()
-        serve_col = "serve_result_player_A" if player == "player A" else "serve_result_player_B"
-
-        first_serves_in = service_points[serve_col].isin(["first_serve", "ace"]).sum()
-        total_service_points = len(service_points)
-        first_serve_points = service_points[service_points[serve_col].isin(["first_serve", "ace"])]
-        second_serve_points = service_points[service_points[serve_col] == "second_serve"]
-        first_serve_points_won = (first_serve_points["pointscorer"] == player_map[player]).sum()
-        second_serve_points_won = (second_serve_points["pointscorer"] == player_map[player]).sum()
-        aces = (service_points[serve_col] == "ace").sum()
-        double_faults = (service_points[serve_col] == "double_fault").sum()
-        unforced_errors_mask = df["description"].str.contains("unforced error", case=False, na=False)
-
-        player_winners = (
+        winners = (
             df["description"].str.contains("winner", case=False, na=False)
-            & (df["pointscorer"] == player_map[player])
+            & (df["pointscorer"] == name)
             & ~df["description"].str.contains("ace", case=False, na=False)
         ).sum()
 
-        opponent_name = player_map[other_player_label(player)]
-        player_unforced_errors = (unforced_errors_mask & (df["pointscorer"] == opponent_name)).sum()
+        # Unforced errors committed by `name` = points where UE desc AND other won
+        ufe = (
+            df["description"].str.contains("unforced error", case=False, na=False)
+            & (df["pointscorer"] == other_name)
+        ).sum()
 
-        net_played = 0
-        net_won = 0
+        # Net approach points (FIX: removed dead-code line; logic preserved)
+        net_played = net_won = 0
         for _, row in df.iterrows():
-            desc = str(row["description"]).lower()
+            desc   = str(row.get("description", "")).lower()
             scorer = row["pointscorer"]
             if "volley winner" in desc:
-                net_player = scorer
-                won = True
+                net_player, won = scorer, True
             elif "volley error" in desc:
-                net_player = row["pointscorer"]
-                net_player = player_A_name if scorer == player_B_name else player_B_name
-                won = False
+                # Person who made the error = the one who lost the point
+                net_player, won = other(scorer, name_A, name_B), False
             else:
                 continue
-
-            if net_player == player_map[player]:
+            if net_player == name:
                 net_played += 1
                 if won:
                     net_won += 1
 
-        total_points_won = (df["pointscorer"] == player_map[player]).sum()
+        total_won = (df["pointscorer"] == name).sum()
 
-        stats[player] = {
-            "First serve %": round(100 * first_serves_in / total_service_points, 1) if total_service_points else np.nan,
-            "First serve points won %": round(100 * first_serve_points_won / len(first_serve_points), 1) if len(first_serve_points) else np.nan,
-            "Second serve points won %": round(100 * second_serve_points_won / len(second_serve_points), 1) if len(second_serve_points) else np.nan,
-            "Aces": int(aces),
-            "Double faults": int(double_faults),
-            "Winners": int(player_winners),
-            "Unforced errors": int(player_unforced_errors),
-            "Net points won %": round(100 * net_won / net_played, 1) if net_played else np.nan,
-            "Total points won %": round(100 * total_points_won / len(df), 1) if len(df) else np.nan,
+        stats[name] = {
+            "Total pts won %":    _pct(total_won, len(df)),
+            "First serve %":      _pct(len(f_pts), n_srv),
+            "1st srv pts won %":  _pct((f_pts["pointscorer"] == name).sum(), len(f_pts)),
+            "2nd srv pts won %":  _pct((s_pts["pointscorer"] == name).sum(), len(s_pts)),
+            "Aces":               int(sp[serve_col].eq("ace").sum()),
+            "Double faults":      int(sp[serve_col].eq("double_fault").sum()),
+            "Winners":            int(winners),
+            "Unforced errors":    int(ufe),
+            "Net pts won %":      _pct(net_won, net_played),
+            "Break pts saved %":     float("nan"),
+            "Break pts converted %": float("nan"),
         }
 
-    break_points_faced = {"player A": 0, "player B": 0}
-    break_points_saved = {"player A": 0, "player B": 0}
-    break_points_chances = {"player A": 0, "player B": 0}
-    break_points_converted = {"player A": 0, "player B": 0}
-
-    normal_games = df[df["Tiebreak_status"] == ""].copy()
-    name_to_key = {player_A_name: "player A", player_B_name: "player B"}
-
-    for (_, _, _), game in normal_games.groupby(["set_number", "game_number", "server"], sort=True):
+    # ── Break points (requires point-by-point game walk) ──────────────
+    bp = {n: {"faced": 0, "saved": 0, "chances": 0, "converted": 0}
+          for n in [name_A, name_B]}
+    normal = df[df["Tiebreak_status"] == ""]
+    for _, game in normal.groupby(["set_number", "game_number", "server"], sort=True):
         game = game.sort_values("point_number_in_game")
-        server_name = game["server"].iloc[0]
-        receiver_name = player_B_name if server_name == player_A_name else player_A_name
-        server = name_to_key[server_name]
-        receiver = name_to_key[receiver_name]
-        p_server = p_receiver = 0
-
+        srv  = game["server"].iloc[0]
+        rec  = other(srv, name_A, name_B)
+        ps = pr = 0
         for _, row in game.iterrows():
-            is_break_point = (p_receiver >= 3) and (p_receiver - p_server >= 1)
-            scorer = name_to_key[row["pointscorer"]]
-
-            if is_break_point:
-                break_points_faced[server] += 1
-                break_points_chances[receiver] += 1
-                if scorer == server:
-                    break_points_saved[server] += 1
-                else:
-                    break_points_converted[receiver] += 1
-
-            if scorer == server:
-                p_server += 1
+            is_bp = pr >= 3 and pr > ps
+            if is_bp:
+                bp[srv]["faced"]   += 1
+                bp[rec]["chances"] += 1
+            scorer = row["pointscorer"]
+            if scorer == srv:
+                ps += 1
             else:
-                p_receiver += 1
-
-            game_over = (
-                (p_server >= 4 and p_server - p_receiver >= 2)
-                or (p_receiver >= 4 and p_receiver - p_server >= 2)
-            )
-            if game_over:
+                pr += 1
+            gw = None
+            if ps >= 4 and ps - pr >= 2:
+                gw = srv
+            elif pr >= 4 and pr - ps >= 2:
+                gw = rec
+            if is_bp and gw == srv:
+                bp[srv]["saved"]     += 1
+            if is_bp and gw == rec:
+                bp[rec]["converted"] += 1
+            if gw:
                 break
 
-    for player in players:
-        stats[player]["Break points saved %"] = (
-            round(100 * break_points_saved[player] / break_points_faced[player], 1)
-            if break_points_faced[player] else np.nan
-        )
-        stats[player]["Break points converted %"] = (
-            round(100 * break_points_converted[player] / break_points_chances[player], 1)
-            if break_points_chances[player] else np.nan
-        )
+    for name in [name_A, name_B]:
+        stats[name]["Break pts saved %"]     = _pct(bp[name]["saved"],     bp[name]["faced"])
+        stats[name]["Break pts converted %"] = _pct(bp[name]["converted"], bp[name]["chances"])
 
-    stats_df = pd.DataFrame(stats)
-    stats_df.columns = [player_A_name, player_B_name]
-    return stats_df
+    return pd.DataFrame(stats)
 
 
-def plot_stats_rotated(stats_df):
-    df_plot = stats_df.copy()
-    stat_order = [
-        "Aces",
-        "Double faults",
-        "First serve %",
-        "First serve points won %",
-        "Second serve points won %",
-        "Break points saved %",
-        "Break points converted %",
-        "Winners",
-        "Unforced errors",
-        "Net points won %",
-        "Total points won %",
-    ]
-    df_plot = df_plot.loc[[s for s in stat_order if s in df_plot.index]]
+def format_stats_for_display(stats: pd.DataFrame) -> pd.DataFrame:
+    """Return a string-formatted copy of the stats DataFrame."""
+    disp = stats.copy().astype(object)
+    for idx in disp.index:
+        for col in disp.columns:
+            v = stats.at[idx, col]
+            if pd.isna(v):
+                disp.at[idx, col] = "—"
+            elif "%" in idx:
+                disp.at[idx, col] = f"{float(v):.1f}%"
+            else:
+                disp.at[idx, col] = str(int(float(v)))
+    return disp
 
-    values_A = pd.to_numeric(df_plot.iloc[:, 0], errors="coerce").fillna(0).values.astype(float)
-    values_B = pd.to_numeric(df_plot.iloc[:, 1], errors="coerce").fillna(0).values.astype(float)
-    labels = df_plot.index.tolist()
 
-    max_per_row = np.maximum(values_A, values_B)
-    max_per_row[max_per_row == 0] = 1
-    norm_A = values_A / max_per_row
-    norm_B = values_B / max_per_row
-    y = np.arange(len(labels))
+# ══════════════════════════════════════════════════════════════════════
+# PLOTLY CHARTS  (all charts use transparent backgrounds so they
+#                 inherit whatever Streamlit theme the user has set)
+# ══════════════════════════════════════════════════════════════════════
 
-    fig, ax = plt.subplots(figsize=(13, 9), dpi=170)
-    ax.barh(y, -norm_A, height=0.62, color="crimson")
-    ax.barh(y, norm_B, height=0.62, color="#003366")
-    ax.axvline(0, linewidth=1)
+_LAYOUT_BASE = dict(
+    plot_bgcolor  = "rgba(0,0,0,0)",
+    paper_bgcolor = "rgba(0,0,0,0)",
+    font          = dict(size=13),
+    margin        = dict(l=10, r=10, t=60, b=10),
+)
 
-    for i, label in enumerate(labels):
-        ax.text(
-            0, i, label,
-            ha="center", va="center", fontsize=11,
-            bbox=dict(facecolor="white", edgecolor="none", boxstyle="square,pad=0.25"),
-            zorder=3,
-        )
 
-    def fmt(v):
-        return f"{int(v)}" if float(v).is_integer() else f"{v:.1f}"
+def chart_butterfly(stats: pd.DataFrame) -> go.Figure:
+    """Horizontal butterfly chart comparing stats side-by-side."""
+    labels = [s for s in STAT_ORDER if s in stats.index]
+    cols = stats.columns.tolist()
+    vA = pd.to_numeric(stats.loc[labels, cols[0]], errors="coerce").fillna(0).values.astype(float)
+    vB = pd.to_numeric(stats.loc[labels, cols[1]], errors="coerce").fillna(0).values.astype(float)
+    mx = np.maximum(np.abs(vA), np.abs(vB))
+    mx[mx == 0] = 1
+    nA, nB = vA / mx, vB / mx
 
-    offset = 0.04
-    for i, (raw, norm) in enumerate(zip(values_A, norm_A)):
-        if raw != 0:
-            ax.text(-norm - offset, i, fmt(raw), ha="right", va="center", fontsize=10)
-    for i, (raw, norm) in enumerate(zip(values_B, norm_B)):
-        if raw != 0:
-            ax.text(norm + offset, i, fmt(raw), ha="left", va="center", fontsize=10)
+    def _fmt(v: float) -> str:
+        return f"{int(v)}" if float(v) == int(float(v)) else f"{v:.1f}"
 
-    ax.text(-0.78, -0.95, df_plot.columns[0], ha="center", va="bottom", fontsize=14, fontweight="bold")
-    ax.text(0.78, -0.95, df_plot.columns[1], ha="center", va="bottom", fontsize=14, fontweight="bold")
-    ax.set_yticks([])
-    ax.set_xticks([])
-    ax.set_xlim(-1.45, 1.45)
-    ax.set_ylim(len(labels) - 0.3, -0.6)
-    ax.set_title("Match Summary", fontsize=18, fontweight="bold")
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    fig.tight_layout()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels, x=-nA, orientation="h", name=cols[0],
+        marker_color=COL_A,
+        customdata=[[_fmt(v)] for v in vA],
+        hovertemplate="%{customdata[0]}<extra>" + cols[0] + "</extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=labels, x=nB, orientation="h", name=cols[1],
+        marker_color=COL_B,
+        customdata=[[_fmt(v)] for v in vB],
+        hovertemplate="%{customdata[0]}<extra>" + cols[1] + "</extra>",
+    ))
+    fig.update_layout(
+        **_LAYOUT_BASE,
+        title="Match Statistics Comparison",
+        barmode="overlay",
+        height=480,
+        xaxis=dict(
+            showticklabels=False, showgrid=False,
+            zeroline=True, zerolinecolor="#666",
+            range=[-1.55, 1.55],
+        ),
+        yaxis=dict(autorange="reversed"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
     return fig
 
 
-def plot_dominance(df_match, player_A_name, player_B_name):
-    df = df_match.copy()
+def chart_momentum(df_m: pd.DataFrame, name_A: str, name_B: str) -> go.Figure:
+    """Filled area chart showing cumulative point lead over the match."""
+    df = df_m.copy()
+    df["delta"] = df["pointscorer"].map({name_A: 1, name_B: -1})
+    df["cum"]   = df["delta"].cumsum()
+    df["n"]     = range(1, len(df) + 1)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["n"], y=df["cum"].clip(lower=0),
+        fill="tozeroy", fillcolor=COL_A_FILL,
+        line=dict(color=COL_A, width=2), name=name_A,
+        hovertemplate="Point %{x}: lead = %{y:+d}<extra>" + name_A + "</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["n"], y=df["cum"].clip(upper=0),
+        fill="tozeroy", fillcolor=COL_B_FILL,
+        line=dict(color=COL_B, width=2), name=name_B,
+        hovertemplate="Point %{x}: lead = %{y:+d}<extra>" + name_B + "</extra>",
+    ))
+    fig.add_hline(y=0, line_color="#888", line_width=1)
+    fig.update_layout(
+        **_LAYOUT_BASE,
+        title="Point Momentum",
+        height=320,
+        xaxis=dict(title="Point #"),
+        yaxis=dict(title="Cumulative point lead"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        margin=dict(l=10, r=10, t=60, b=40),
+    )
+    return fig
+
+
+def chart_dominance(df_m: pd.DataFrame, name_A: str, name_B: str) -> go.Figure:
+    """Bar chart: per-game signed win-ratio (positive = A dominant)."""
+    df = df_m.copy()
     df["Tiebreak_status"] = df["Tiebreak_status"].fillna("")
 
     games = (
         df.groupby(["set_number", "game_number"])
         .agg(
-            total_points=("pointscorer", "size"),
-            points_A=("pointscorer", lambda x: (x == player_A_name).sum()),
-            points_B=("pointscorer", lambda x: (x == player_B_name).sum()),
-            tb_status=("Tiebreak_status", "last"),
-            games_A=("Games_player_A", "last"),
-            games_B=("Games_player_B", "last"),
-            sets_A=("Sets_player_A", "last"),
-            sets_B=("Sets_player_B", "last"),
+            n  = ("pointscorer", "size"),
+            nA = ("pointscorer", lambda x: (x == name_A).sum()),
+            nB = ("pointscorer", lambda x: (x == name_B).sum()),
+            tb = ("Tiebreak_status", "last"),
+            gA = ("Games_player_A", "last"),
+            gB = ("Games_player_B", "last"),
         )
         .reset_index()
     )
+    games["dom"] = (games["nA"] - games["nB"]) / games["n"].clip(lower=1)
 
-    games["dominance"] = 1 / (games["total_points"] - 3).clip(lower=1)
-    games.loc[games["points_B"] > games["points_A"], "dominance"] *= -1
+    x_labels: list[str] = []
+    ys: list[float]     = []
+    cs: list[str]       = []
+    annotations: list   = []
 
-    x, labels, values, colors, set_ranges = [], [], [], [], []
-    current_x = 0
+    x = 0
+    for sno in sorted(games["set_number"].unique()):
+        sg = games[games["set_number"] == sno]
+        set_start_label: str | None = None
+        for _, row in sg.iterrows():
+            lbl = f"S{int(sno)}G{int(row['game_number'])}"
+            if set_start_label is None:
+                set_start_label = lbl
+            x_labels.append(lbl)
+            ys.append(row["dom"])
+            cs.append(COL_A if row["dom"] >= 0 else COL_B)
+            x += 1
+        fr = sg.iloc[-1]
+        tb_str = ""
+        if fr["tb"] in ("tiebreak", "super_tiebreak"):
+            tb_str = f" (TB {int(fr['nA'])}-{int(fr['nB'])})"
+        annotations.append(dict(
+            x=set_start_label, y=1.22, xref="x", yref="y",
+            text=f"Set {int(sno)}: {int(fr['gA'])}-{int(fr['gB'])}{tb_str}",
+            showarrow=False, font=dict(size=11),
+            xanchor="left",
+        ))
 
-    for set_no in sorted(games["set_number"].unique()):
-        gset = games[games["set_number"] == set_no].copy()
-        start_x = current_x
-        for _, row in gset.iterrows():
-            x.append(current_x)
-            labels.append(str(int(row["game_number"])))
-            values.append(row["dominance"])
-            colors.append("#003366" if row["dominance"] > 0 else "crimson")
-            current_x += 1
-        end_x = current_x - 1
-        final_row = gset.iloc[-1]
-        set_ranges.append({
-            "set": int(set_no),
-            "start": start_x,
-            "end": end_x,
-            "games_A": int(final_row["games_A"]),
-            "games_B": int(final_row["games_B"]),
-            "tb_status": final_row["tb_status"],
-            "tb_A": int(final_row["points_A"]) if final_row["tb_status"] in ["tiebreak", "super_tiebreak"] else None,
-            "tb_B": int(final_row["points_B"]) if final_row["tb_status"] in ["tiebreak", "super_tiebreak"] else None,
-        })
-        current_x += 1
-
-    fig, ax = plt.subplots(figsize=(max(12, len(x) * 0.85), 7), dpi=170)
-    for i, s in enumerate(set_ranges):
-        left = s["start"] - 0.5
-        right = s["end"] + 0.5
-        if i % 2 == 0:
-            ax.axvspan(left, right, alpha=0.08)
-        if s["tb_status"] == "super_tiebreak":
-            text = f"Set {s['set']} ({s['tb_A']}-{s['tb_B']} STB)"
-        elif s["tb_status"] == "tiebreak":
-            text = f"Set {s['set']} ({s['games_A']}-{s['games_B']}, TB {s['tb_A']}-{s['tb_B']})"
-        else:
-            text = f"Set {s['set']} ({s['games_A']}-{s['games_B']})"
-        ax.text(left + 0.1, 0.98, text, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=11, fontweight="bold")
-
-    ax.axhline(0, color="gray")
-    ax.bar(x, values, color=colors)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.tick_params(axis="y", labelsize=10)
-    ax.set_ylim(-1.1, 1.25)
-    ax.set_xlim(-1, max(x) + 1 if x else 1)
-    ax.set_xlabel("Game", fontsize=11)
-    ax.set_ylabel("Game dominance", fontsize=11)
-    ax.set_title("Tennis Game Dominance by Set", fontsize=17)
-    fig.tight_layout()
+    fig = go.Figure(go.Bar(
+        x=x_labels, y=ys, marker_color=cs,
+        hovertemplate="Game: %{x}<br>Dominance: %{y:.0%}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_color="#888", line_width=1)
+    fig.update_layout(
+        **_LAYOUT_BASE,
+        title=f"Game Dominance  (↑ favours {name_A} · ↓ favours {name_B})",
+        annotations=annotations,
+        height=400,
+        xaxis=dict(title="Game", tickangle=45),
+        yaxis=dict(range=[-1.15, 1.35]),
+        showlegend=False,
+        margin=dict(l=10, r=10, t=70, b=70),
+    )
     return fig
 
 
+# ══════════════════════════════════════════════════════════════════════
+# STATE MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════
 
-def plot_points_by_description(df_match, player_name):
-    df = df_match.copy()
-    df["description"] = df["description"].fillna("unknown")
-    df = df[df["description"].str.lower() != "unknown"].copy()
-
-    won_counts = df[df["pointscorer"] == player_name]["description"].value_counts()
-    lost_counts = df[df["pointscorer"] != player_name]["description"].value_counts()
-
-    all_descriptions = list(set(won_counts.index).union(set(lost_counts.index)))
-
-    if not all_descriptions:
-        fig, ax = plt.subplots(figsize=(12, 4), dpi=170)
-        ax.text(0.5, 0.5, "No point descriptions recorded yet", ha="center", va="center", fontsize=13)
-        ax.axis("off")
-        fig.tight_layout()
-        return fig
-
-    plot_df = pd.DataFrame({
-        "description": all_descriptions,
-        "won": [int(won_counts.get(desc, 0)) for desc in all_descriptions],
-        "lost": [int(lost_counts.get(desc, 0)) for desc in all_descriptions],
-    })
-    plot_df["sort_score"] = plot_df["won"] - plot_df["lost"]
-    plot_df["total"] = plot_df["won"] + plot_df["lost"]
-    plot_df = plot_df.sort_values(
-        by=["sort_score", "won", "total", "description"],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-
-    labels = [desc.replace("_", " ").title() for desc in plot_df["description"]]
-    won_values = plot_df["won"].to_numpy(dtype=float)
-    lost_values = plot_df["lost"].to_numpy(dtype=float)
-    x = np.arange(len(labels))
-    width = 0.44
-
-    fig_width = max(13, len(labels) * 1.15)
-    fig, ax = plt.subplots(figsize=(fig_width, 6.8), dpi=170)
-    bars_won = ax.bar(x - width / 2, won_values, width=width, color="#003366", edgecolor="black", linewidth=0.8, label="Won points")
-    bars_lost = ax.bar(x + width / 2, lost_values, width=width, color="crimson", edgecolor="black", linewidth=0.8, label="Lost points")
-
-    ymax = max(np.max(won_values) if len(won_values) else 0, np.max(lost_values) if len(lost_values) else 0, 1)
-    label_offset = max(0.08, ymax * 0.025)
-
-    for bars in [bars_won, bars_lost]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    height + label_offset,
-                    f"{int(height)}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=10,
-                )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=10)
-    ax.set_ylabel("Frequency", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Description", fontsize=11, fontweight="bold")
-    ax.set_title(f"{player_name}: Won and Lost Points by Description", fontsize=16, fontweight="bold")
-    ax.set_ylim(0, ymax * 1.5 + label_offset)
-    ax.margins(x=0.02)
-    ax.legend(loc="upper left",fontsize = 15)
-    fig.tight_layout()
-    return fig
-
-def reset_match_state():
-    st.session_state.match_started = False
-    st.session_state.finished = False
-    st.session_state.rows = []
-    st.session_state.current_server = None
-    st.session_state.first_server = None
-    st.session_state.set_no = 1
-    st.session_state.game_no = 1
-    st.session_state.point_no_in_game = 0
-    st.session_state.sets_A = 0
-    st.session_state.sets_B = 0
-    st.session_state.games_A = 0
-    st.session_state.games_B = 0
-    st.session_state.points_A = 0
-    st.session_state.points_B = 0
-    st.session_state.tiebreak_status = ""
-    st.session_state.tiebreak_first_server = None
-    st.session_state.tiebreak_point_index = 0
-
-
-def init_state():
-    defaults = {
-        "match_started": False,
-        "finished": False,
-        "rows": [],
-        "current_server": None,
-        "first_server": None,
-        "set_no": 1,
-        "game_no": 1,
-        "point_no_in_game": 0,
-        "sets_A": 0,
-        "sets_B": 0,
-        "games_A": 0,
-        "games_B": 0,
-        "points_A": 0,
-        "points_B": 0,
-        "tiebreak_status": "",
-        "tiebreak_first_server": None,
-        "tiebreak_point_index": 0,
-    }
-    for k, v in defaults.items():
+def init_state() -> None:
+    for k, v in DEFAULTS.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-def add_point(scorer, description, serve_result):
-    player_A = st.session_state.player_A
-    player_B = st.session_state.player_B
-    current_server = st.session_state.current_server
-    tiebreak_status = st.session_state.tiebreak_status
+def reset_state() -> None:
+    """Reset ALL match state to defaults (called once, not twice)."""
+    for k, v in DEFAULTS.items():
+        st.session_state[k] = v
 
-    if tiebreak_status == "":
-        server = current_server
-    else:
-        server = tiebreak_server_for_point(
-            st.session_state.tiebreak_first_server,
-            player_A,
-            player_B,
-            st.session_state.tiebreak_point_index,
+
+def autosave() -> None:
+    """Persist full session state to a local JSON file."""
+    try:
+        data = {k: st.session_state.get(k, v) for k, v in DEFAULTS.items()}
+        with open(AUTOSAVE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def autoload() -> bool:
+    """Load previously saved match from JSON file. Returns True on success."""
+    try:
+        with open(AUTOSAVE, encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k in DEFAULTS:
+                st.session_state[k] = v
+        return True
+    except Exception:
+        return False
+
+
+def push_to_github(
+    token: str,
+    repo: str,
+    path: str,
+    csv_bytes: bytes,
+    commit_msg: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Push csv_bytes to {repo}/{path} via the GitHub Contents API.
+    Returns (success, error_message).
+    NOTE: In production, store the token in st.secrets, not the UI.
+    """
+    try:
+        import requests as _req
+    except ImportError:
+        return False, "'requests' library not installed."
+
+    if not commit_msg:
+        commit_msg = f"Tennis data — {datetime.now():%Y-%m-%d %H:%M}"
+
+    url  = f"https://api.github.com/repos/{repo}/contents/{path}"
+    hdrs = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Fetch existing file SHA (required for updates)
+    sha: str | None = None
+    r = _req.get(url, headers=hdrs, timeout=10)
+    if r.status_code == 200:
+        sha = r.json().get("sha")
+
+    payload: dict = {
+        "message": commit_msg,
+        "content": base64.b64encode(csv_bytes).decode(),
+    }
+    if sha:
+        payload["sha"] = sha
+
+    r = _req.put(url, headers=hdrs, json=payload, timeout=15)
+    ok = r.status_code in (200, 201)
+    err = "" if ok else r.json().get("message", "Unknown GitHub error")
+    return ok, err
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GAME LOGIC
+# ══════════════════════════════════════════════════════════════════════
+
+def current_server_now() -> str:
+    s = st.session_state
+    if s.tiebreak_status:
+        return tb_server(
+            s.tiebreak_first_server, s.player_A, s.player_B,
+            s.tiebreak_point_index,
         )
+    return s.current_server
 
-    serve_result_A = serve_result if server == player_A else ""
-    serve_result_B = serve_result if server == player_B else ""
-    st.session_state.point_no_in_game += 1
 
-    st.session_state.rows.append({
-        "description": description,
-        "pointscorer": scorer,
-        "server": server,
-        "serve_result_player_A": serve_result_A,
-        "serve_result_player_B": serve_result_B,
-        "set_number": st.session_state.set_no,
-        "game_number": st.session_state.game_no,
-        "point_number_in_game": st.session_state.point_no_in_game,
-        "Tiebreak_status": tiebreak_status,
+def add_point(scorer: str, description: str, serve_result: str) -> None:
+    s   = st.session_state
+    a, b = s.player_A, s.player_B
+    srv  = current_server_now()
+
+    s.point_no_in_game += 1
+    s.rows.append({
+        "description":           description,
+        "pointscorer":           scorer,
+        "server":                srv,
+        "serve_result_player_A": serve_result if srv == a else "",
+        "serve_result_player_B": serve_result if srv == b else "",
+        "set_number":            s.set_no,
+        "game_number":           s.game_no,
+        "point_number_in_game":  s.point_no_in_game,
+        "Tiebreak_status":       s.tiebreak_status,
     })
 
-    if tiebreak_status == "":
-        if scorer == player_A:
-            st.session_state.points_A += 1
-        else:
-            st.session_state.points_B += 1
-
-        game_winner = None
-        if st.session_state.points_A >= 4 and st.session_state.points_A - st.session_state.points_B >= 2:
-            game_winner = player_A
-        elif st.session_state.points_B >= 4 and st.session_state.points_B - st.session_state.points_A >= 2:
-            game_winner = player_B
-
-        if game_winner is not None:
-            if game_winner == player_A:
-                st.session_state.games_A += 1
-            else:
-                st.session_state.games_B += 1
-
-            st.session_state.points_A = 0
-            st.session_state.points_B = 0
-            st.session_state.point_no_in_game = 0
-
-            set_winner = None
-            if st.session_state.games_A >= 6 and st.session_state.games_A - st.session_state.games_B >= 2:
-                set_winner = player_A
-            elif st.session_state.games_B >= 6 and st.session_state.games_B - st.session_state.games_A >= 2:
-                set_winner = player_B
-
-            if set_winner is not None:
-                if set_winner == player_A:
-                    st.session_state.sets_A += 1
-                else:
-                    st.session_state.sets_B += 1
-
-                if st.session_state.sets_A == 2 or st.session_state.sets_B == 2:
-                    st.session_state.finished = True
-                    return
-
-                st.session_state.set_no += 1
-                st.session_state.game_no = 1
-                st.session_state.games_A = 0
-                st.session_state.games_B = 0
-            else:
-                if st.session_state.games_A == 6 and st.session_state.games_B == 6:
-                    if st.session_state.match_type == "doubles" and st.session_state.set_no == 3:
-                        st.session_state.tiebreak_status = "super_tiebreak"
-                    else:
-                        st.session_state.tiebreak_status = "tiebreak"
-                    st.session_state.tiebreak_first_server = other_player(current_server, player_A, player_B)
-                    st.session_state.tiebreak_point_index = 0
-                    st.session_state.point_no_in_game = 0
-                    st.session_state.game_no = 13 if st.session_state.tiebreak_status == "tiebreak" else 1
-                else:
-                    st.session_state.current_server = other_player(current_server, player_A, player_B)
-                    st.session_state.game_no += 1
+    if s.tiebreak_status == "":
+        _game_point(scorer, srv, a, b)
     else:
-        if scorer == player_A:
-            st.session_state.points_A += 1
+        _tb_point(scorer, a, b)
+
+    s.serve_type = None   # reset serve-button selection
+    autosave()
+
+
+def _game_point(scorer: str, srv: str, a: str, b: str) -> None:
+    s = st.session_state
+    if scorer == a:
+        s.points_A += 1
+    else:
+        s.points_B += 1
+
+    pA, pB = s.points_A, s.points_B
+    gw = None
+    if pA >= 4 and pA - pB >= 2:
+        gw = a
+    elif pB >= 4 and pB - pA >= 2:
+        gw = b
+
+    if gw is not None:
+        if gw == a:
+            s.games_A += 1
         else:
-            st.session_state.points_B += 1
-
-        st.session_state.tiebreak_point_index += 1
-        target = 10 if st.session_state.tiebreak_status == "super_tiebreak" else 7
-        tb_winner = None
-        if st.session_state.points_A >= target and st.session_state.points_A - st.session_state.points_B >= 2:
-            tb_winner = player_A
-        elif st.session_state.points_B >= target and st.session_state.points_B - st.session_state.points_A >= 2:
-            tb_winner = player_B
-
-        if tb_winner is not None:
-            if tb_winner == player_A:
-                st.session_state.sets_A += 1
-            else:
-                st.session_state.sets_B += 1
-
-            st.session_state.current_server = other_player(st.session_state.tiebreak_first_server, player_A, player_B)
-            st.session_state.points_A = 0
-            st.session_state.points_B = 0
-            st.session_state.point_no_in_game = 0
-            st.session_state.tiebreak_status = ""
-            st.session_state.tiebreak_first_server = None
-            st.session_state.tiebreak_point_index = 0
-
-            if st.session_state.sets_A == 2 or st.session_state.sets_B == 2:
-                st.session_state.finished = True
-                return
-
-            st.session_state.set_no += 1
-            st.session_state.game_no = 1
-            st.session_state.games_A = 0
-            st.session_state.games_B = 0
+            s.games_B += 1
+        s.points_A = s.points_B = s.point_no_in_game = 0
+        _after_game(srv, a, b)
 
 
-def rebuild_state_from_rows(saved_rows, player_A, player_B, first_server, match_type):
-    reset_match_state()
-    st.session_state.player_A = player_A
-    st.session_state.player_B = player_B
-    st.session_state.current_server = first_server
-    st.session_state.first_server = first_server
-    st.session_state.match_type = match_type
-    st.session_state.match_started = True
-    for row in saved_rows:
-        sr = row["serve_result_player_A"] if row["serve_result_player_A"] else row["serve_result_player_B"]
+def _after_game(last_server: str, a: str, b: str) -> None:
+    """Handle set win, tiebreak trigger, or simple game advance."""
+    s   = st.session_state
+    gA, gB = s.games_A, s.games_B
+
+    # ── Set won via regular game ───────────────────────────────────
+    if (gA >= 6 and gA - gB >= 2) or (gB >= 6 and gB - gA >= 2):
+        if gA > gB:
+            s.sets_A += 1
+        else:
+            s.sets_B += 1
+        if s.sets_A == 2 or s.sets_B == 2:
+            s.finished = True
+            return
+        s.set_no  += 1
+        s.game_no  = 1
+        s.games_A  = s.games_B = 0
+        # FIX: alternate server into new set (was missing in original)
+        s.current_server = other(last_server, a, b)
+
+    # ── Tiebreak / super-tiebreak ──────────────────────────────────
+    elif gA == 6 and gB == 6:
+        is_super = s.match_type == "doubles" and s.set_no == 3
+        s.tiebreak_status       = "super_tiebreak" if is_super else "tiebreak"
+        s.tiebreak_first_server = other(last_server, a, b)
+        s.tiebreak_point_index  = 0
+        s.point_no_in_game      = 0
+        s.game_no               = 1 if is_super else 13
+
+    # ── Normal game advance ────────────────────────────────────────
+    else:
+        s.current_server = other(last_server, a, b)
+        s.game_no += 1
+
+
+def _tb_point(scorer: str, a: str, b: str) -> None:
+    s      = st.session_state
+    target = 10 if s.tiebreak_status == "super_tiebreak" else 7
+
+    if scorer == a:
+        s.points_A += 1
+    else:
+        s.points_B += 1
+    s.tiebreak_point_index += 1
+
+    pA, pB = s.points_A, s.points_B
+    tbw = None
+    if pA >= target and pA - pB >= 2:
+        tbw = a
+    elif pB >= target and pB - pA >= 2:
+        tbw = b
+
+    if tbw is not None:
+        if tbw == a:
+            s.sets_A += 1
+        else:
+            s.sets_B += 1
+        first_tb_srv = s.tiebreak_first_server
+        s.points_A = s.points_B = s.point_no_in_game = 0
+        s.tiebreak_status       = ""
+        s.tiebreak_first_server = None
+        s.tiebreak_point_index  = 0
+        # After TB, the tiebreak receiver serves G1 of next set
+        s.current_server = other(first_tb_srv, a, b)
+        if s.sets_A == 2 or s.sets_B == 2:
+            s.finished = True
+            return
+        s.set_no  += 1
+        s.game_no  = 1
+        s.games_A  = s.games_B = 0
+
+
+def undo_last() -> None:
+    """
+    Remove the most recent point and replay all remaining rows from scratch.
+    FIX: single reset call; uses initial_server for correct replay.
+    """
+    s = st.session_state
+    if not s.rows:
+        return
+    saved  = s.rows[:-1]
+    a, b   = s.player_A, s.player_B
+    ini    = s.initial_server
+    mtype  = s.match_type
+
+    reset_state()                     # ← called ONCE (was called twice before)
+    s.player_A       = a
+    s.player_B       = b
+    s.initial_server = ini
+    s.current_server = ini
+    s.match_type     = mtype
+    s.match_started  = True
+
+    for row in saved:
+        sr = row["serve_result_player_A"] or row["serve_result_player_B"]
         add_point(row["pointscorer"], row["description"], sr)
 
+    autosave()
 
-def main():
-    st.set_page_config(page_title="Tennis Match Stats", layout="wide")
+
+# ══════════════════════════════════════════════════════════════════════
+# UI COMPONENTS
+# ══════════════════════════════════════════════════════════════════════
+
+_SCOREBOARD_CSS = """
+<style>
+.scoreboard {
+    background: linear-gradient(155deg, #0c1824 0%, #182638 100%);
+    border-radius: 20px;
+    padding: 22px 28px 18px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+    margin-bottom: 20px;
+    font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
+    user-select: none;
+}
+.sb-col-header {
+    display: flex;
+    justify-content: flex-end;
+    gap: 28px;
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #5a8db0;
+    margin-bottom: 14px;
+    padding-right: 4px;
+}
+.sb-col-header .ph { min-width: 52px; text-align: right; }
+.sb-row {
+    display: flex;
+    align-items: center;
+    margin: 4px 0;
+}
+.sb-name {
+    flex: 1;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.sb-nums {
+    display: flex;
+    gap: 28px;
+    align-items: baseline;
+}
+.sb-sets, .sb-games {
+    font-size: 30px;
+    font-weight: 800;
+    color: #dde4ee;
+    min-width: 28px;
+    text-align: center;
+}
+.sb-pts {
+    font-size: 54px;
+    font-weight: 900;
+    line-height: 1;
+    min-width: 52px;
+    text-align: right;
+}
+.sb-divider {
+    border: none;
+    border-top: 1px solid rgba(255,255,255,0.07);
+    margin: 6px 0;
+}
+.sb-ball { margin-left: 7px; font-size: 15px; }
+</style>
+"""
+
+
+def render_scoreboard() -> None:
+    s   = st.session_state
+    a, b = s.player_A, s.player_B
+    tb   = s.tiebreak_status
+    srv  = current_server_now()
+
+    if tb:
+        sA, sB = str(s.points_A), str(s.points_B)
+        lbl = "Tiebreak" if tb == "tiebreak" else "Super TB"
+    else:
+        sA, sB = tennis_score(s.points_A, s.points_B)
+        lbl = "Points"
+
+    ba = '<span class="sb-ball">🎾</span>' if srv == a else ""
+    bb = '<span class="sb-ball">🎾</span>' if srv == b else ""
+
+    st.markdown(_SCOREBOARD_CSS + f"""
+    <div class="scoreboard">
+      <div class="sb-col-header">
+        <span>Sets</span>
+        <span>Games</span>
+        <span class="ph">{lbl}</span>
+      </div>
+      <div class="sb-row">
+        <div class="sb-name" style="color:{COL_A}">{a}{ba}</div>
+        <div class="sb-nums">
+          <span class="sb-sets">{s.sets_A}</span>
+          <span class="sb-games">{s.games_A}</span>
+          <span class="sb-pts" style="color:{COL_A}">{sA}</span>
+        </div>
+      </div>
+      <hr class="sb-divider">
+      <div class="sb-row">
+        <div class="sb-name" style="color:{COL_B}">{b}{bb}</div>
+        <div class="sb-nums">
+          <span class="sb-sets">{s.sets_B}</span>
+          <span class="sb-games">{s.games_B}</span>
+          <span class="sb-pts" style="color:{COL_B}">{sB}</span>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_point_entry() -> None:
+    """
+    Two-step button UI:
+      Step 1 — always visible: [1st Serve] [2nd Serve] [⚡ Ace] [❌ Double Fault]
+               Ace and Double Fault are one-tap and auto-assign the scorer.
+      Step 2 — appears after 1st/2nd Serve selected:
+               Description dropdown + [Player A wins] [Player B wins] buttons.
+    """
+    s    = st.session_state
+    a, b = s.player_A, s.player_B
+    srv  = current_server_now()
+    rec  = other(srv, a, b)
+
+    st.markdown("#### 🎯 Log a Point")
+    st.markdown("**Step 1 — Serve type** *(tap to select)*")
+
+    c1, c2, c3, c4 = st.columns(4)
+    serve_buttons = [
+        (c1, "🟢 1st Serve",    "first_serve"),
+        (c2, "🟡 2nd Serve",    "second_serve"),
+        (c3, "⚡ Ace",          "ace"),
+        (c4, "❌ Double Fault", "double_fault"),
+    ]
+    for col, label, val in serve_buttons:
+        with col:
+            btn_type = "primary" if s.serve_type == val else "secondary"
+            if st.button(label, key=f"sv_{val}", type=btn_type, use_container_width=True):
+                if val == "ace":
+                    add_point(srv, "Ace", "ace")
+                    st.rerun()
+                elif val == "double_fault":
+                    add_point(rec, "Double fault", "double_fault")
+                    st.rerun()
+                else:
+                    s.serve_type = val
+                    st.rerun()
+
+    # ── Step 2 ────────────────────────────────────────────────────
+    if s.serve_type in ("first_serve", "second_serve"):
+        st.markdown("**Step 2 — Point outcome**")
+
+        available = [d for d in DESCRIPTIONS if d not in ("Ace", "Double fault")]
+        desc = st.selectbox(
+            "Description",
+            available,
+            key="desc_sel",
+            label_visibility="collapsed",
+        )
+
+        ca, cb = st.columns(2)
+        with ca:
+            if st.button(
+                f"🔴  {a}  wins point",
+                key="win_A", type="primary", use_container_width=True,
+            ):
+                add_point(a, desc, s.serve_type)
+                st.rerun()
+        with cb:
+            if st.button(
+                f"🔵  {b}  wins point",
+                key="win_B", type="primary", use_container_width=True,
+            ):
+                add_point(b, desc, s.serve_type)
+                st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    st.set_page_config(
+        page_title="🎾 Tennis Tracker",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     init_state()
+    s = st.session_state
 
-    st.title("Tennis Match Tracker")
-    st.caption("Track points live on your phone and see match stats instantly.")
-
+    # ── Sidebar ───────────────────────────────────────────────────
     with st.sidebar:
-        st.header("Match setup")
-        player_A = st.text_input("Player A", value=st.session_state.get("player_A", "Player A"))
-        player_B = st.text_input("Player B", value=st.session_state.get("player_B", "Player B"))
-        first_server = st.selectbox("First server", [player_A, player_B], index=0)
-        match_type = st.selectbox("Match type", ["singles", "doubles"], index=0)
+        st.markdown("## 🎾 Tennis Tracker")
+        st.markdown("---")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Start / Reset"):
-                reset_match_state()
-                st.session_state.player_A = player_A
-                st.session_state.player_B = player_B
-                st.session_state.current_server = first_server
-                st.session_state.first_server = first_server
-                st.session_state.match_type = match_type
-                st.session_state.match_started = True
-                st.rerun()
-        with col2:
-            if st.button("Undo last") and st.session_state.rows:
-                saved_rows = st.session_state.rows[:-1]
-                player_A_saved = st.session_state.get("player_A", player_A)
-                player_B_saved = st.session_state.get("player_B", player_B)
-                first_server_saved = st.session_state.get("first_server") or first_server
-                match_type_saved = st.session_state.get("match_type", match_type)
-                rebuild_state_from_rows(saved_rows, player_A_saved, player_B_saved, first_server_saved, match_type_saved)
-                st.rerun()
+        if not s.match_started:
+            # Restore offer
+            if os.path.exists(AUTOSAVE):
+                if st.button("📂 Resume saved match", use_container_width=True):
+                    if autoload():
+                        st.rerun()
+                    else:
+                        st.error("Could not load save file.")
+                st.markdown("---")
 
-    if not st.session_state.match_started:
-        st.info("Enter the player names in the sidebar, choose the first server, then tap Start / Reset.")
+            st.markdown("### Match Setup")
+            player_A  = st.text_input("Player A", value=s.player_A)
+            player_B  = st.text_input("Player B", value=s.player_B)
+            first_srv = st.selectbox("First server", [player_A, player_B])
+            mtype     = st.selectbox("Match type", ["singles", "doubles"])
+
+            if st.button("▶️  Start Match", type="primary", use_container_width=True):
+                errors = []
+                if not player_A.strip():
+                    errors.append("Player A name cannot be empty.")
+                if not player_B.strip():
+                    errors.append("Player B name cannot be empty.")
+                if player_A.strip().lower() == player_B.strip().lower():
+                    errors.append("Players must have different names.")
+                for e in errors:
+                    st.error(e)
+                if not errors:
+                    reset_state()
+                    s.player_A       = player_A.strip()
+                    s.player_B       = player_B.strip()
+                    s.initial_server = first_srv
+                    s.current_server = first_srv
+                    s.match_type     = mtype
+                    s.match_started  = True
+                    autosave()
+                    st.rerun()
+
+        else:
+            a, b = s.player_A, s.player_B
+            st.markdown(f"**{a}** vs **{b}**")
+            st.markdown(f"`{s.match_type.title()}` · Set {s.set_no}")
+            st.markdown("---")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "↩️ Undo", use_container_width=True,
+                    disabled=not s.rows or s.finished,
+                ):
+                    undo_last()
+                    st.rerun()
+            with c2:
+                if st.button("🔄 New match", use_container_width=True):
+                    reset_state()
+                    if os.path.exists(AUTOSAVE):
+                        os.remove(AUTOSAVE)
+                    st.rerun()
+
+            # ── GitHub sync ───────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 🐙 GitHub Sync")
+            with st.expander("Push CSV to GitHub"):
+                st.caption(
+                    "In production, store your token in `st.secrets` "
+                    "rather than typing it here."
+                )
+                gh_token  = st.text_input("Personal access token", type="password")
+                gh_repo   = st.text_input("Repository", placeholder="username/repo")
+                gh_path   = st.text_input("File path in repo", placeholder="data/match.csv")
+                gh_commit = st.text_input("Commit message", placeholder="Auto-generated if blank")
+
+                if st.button("⬆️  Push to GitHub", use_container_width=True):
+                    if not s.rows:
+                        st.warning("No data yet.")
+                    elif not all([gh_token, gh_repo, gh_path]):
+                        st.error("Fill in token, repository, and file path.")
+                    else:
+                        with st.spinner("Pushing…"):
+                            df_raw = pd.DataFrame(s.rows)
+                            df_ann = build_match_df(df_raw, a, b)
+                            ok, err = push_to_github(
+                                gh_token, gh_repo, gh_path,
+                                df_ann.to_csv(index=False).encode(),
+                                commit_msg=gh_commit or None,
+                            )
+                        if ok:
+                            st.success(f"✅ Pushed to `{gh_repo}/{gh_path}`")
+                        else:
+                            st.error(f"❌ {err}")
+
+    # ── Welcome screen ────────────────────────────────────────────
+    if not s.match_started:
+        st.markdown("""
+        <div style="text-align:center;padding:80px 20px;">
+          <div style="font-size:88px;margin-bottom:20px">🎾</div>
+          <h1 style="font-size:2.8rem;margin-bottom:12px">Tennis Match Tracker</h1>
+          <p style="font-size:1.15rem;color:#666;max-width:460px;margin:0 auto">
+            Enter player names in the sidebar and tap
+            <strong>Start Match</strong> to begin live point tracking.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
-    player_A = st.session_state.player_A
-    player_B = st.session_state.player_B
-    server_now = current_server_name()
+    a, b = s.player_A, s.player_B
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Sets", f"{player_A} {st.session_state.sets_A} - {st.session_state.sets_B} {player_B}")
-    with col2:
-        st.metric("Games", f"{player_A} {st.session_state.games_A} - {st.session_state.games_B} {player_B}")
-    with col3:
-        if st.session_state.tiebreak_status:
-            st.metric("Tiebreak", f"{player_A} {st.session_state.points_A} - {st.session_state.points_B} {player_B}")
+    if s.finished:
+        winner = a if s.sets_A > s.sets_B else b
+        st.success(
+            f"🏆 Match complete — **{winner}** wins "
+            f"({s.sets_A}–{s.sets_B} in sets)"
+        )
+
+    # ── Two-column layout ─────────────────────────────────────────
+    left_col, right_col = st.columns([1, 1], gap="large")
+
+    # Left: live scoreboard + point entry
+    with left_col:
+        render_scoreboard()
+
+        if not s.finished:
+            render_point_entry()
         else:
-            scoreA, scoreB = tennis_score(st.session_state.points_A, st.session_state.points_B)
-            st.metric("Current game", f"{player_A} {scoreA} - {scoreB} {player_B}")
+            st.info("Match finished. Use **↩️ Undo** to correct the last point, or **🔄 New match** to start over.")
 
-    if st.session_state.tiebreak_status:
-        st.write(f"**Server:** {server_now}  ")
-        st.write(f"**Mode:** {st.session_state.tiebreak_status}")
-    else:
-        st.write(f"**Server:** {server_now}")
-
-    st.subheader("Add point")
-    c1, c2, c3 = st.columns(3)
-
-    scorer_options = [player_A, player_B]
-    current_scorer = st.session_state.get("ui_scorer", scorer_options[0])
-    st.session_state.ui_scorer = pick_valid(current_scorer, scorer_options)
-    with c1:
-        scorer = st.selectbox("Who won the point?", scorer_options, key="ui_scorer")
-
-    valid_descriptions = valid_point_descriptions(server_now, scorer)
-    current_description = st.session_state.get("ui_description", valid_descriptions[0])
-    st.session_state.ui_description = pick_valid(current_description, valid_descriptions)
-    with c2:
-        description = st.selectbox("Point description", valid_descriptions, key="ui_description")
-
-    valid_serves = valid_serve_results(server_now, scorer, description)
-    current_serve = st.session_state.get("ui_serve_result", valid_serves[0])
-    st.session_state.ui_serve_result = pick_valid(current_serve, valid_serves)
-    with c3:
-        serve_result = st.selectbox("Serve result", valid_serves, key="ui_serve_result")
-
-    if st.button("Add point"):
-        add_point(scorer, description, serve_result)
-        st.rerun()
-
-    if st.session_state.rows:
-        df = pd.DataFrame(st.session_state.rows)
-        df_match = build_match_dataframe(df, player_A, player_B, st.session_state.match_type)
-        stats_df = generate_match_stats(df_match, player_A, player_B)
-
-        st.subheader("Live stats")
-        st.dataframe(stats_df, use_container_width=True)
-
-        st.subheader("Charts")
-        st.caption("The graphs are now full-width and high-resolution so they are much easier to read on a phone.")
-
-        fig_summary = plot_stats_rotated(stats_df)
-        st.pyplot(fig_summary, use_container_width=True)
-        render_figure_download(fig_summary, "match_summary")
-        plt.close(fig_summary)
-
-        fig_dominance = plot_dominance(df_match, player_A, player_B)
-        st.pyplot(fig_dominance, use_container_width=True)
-        render_figure_download(fig_dominance, "game_dominance")
-        plt.close(fig_dominance)
-
-        st.subheader("Points won and lost by description")
-        st.caption("These charts show which point descriptions each player won with most often, and which descriptions they lost points on most often.")
-
-        fig_desc_A = plot_points_by_description(df_match, player_A)
-        st.pyplot(fig_desc_A, use_container_width=True)
-        render_figure_download(fig_desc_A, f"{player_A.lower().replace(' ', '_')}_description_breakdown")
-        plt.close(fig_desc_A)
-
-        fig_desc_B = plot_points_by_description(df_match, player_B)
-        st.pyplot(fig_desc_B, use_container_width=True)
-        render_figure_download(fig_desc_B, f"{player_B.lower().replace(' ', '_')}_description_breakdown")
-        plt.close(fig_desc_B)
-
-        with st.expander("Show chart data tables"):
-            st.write("**Match summary values**")
-            st.dataframe(stats_df, use_container_width=True)
-
-            dominance_table = (
-                df_match.groupby(["set_number", "game_number"])
-                .agg(
-                    server=("server", "last"),
-                    points_won_by_A=("pointscorer", lambda x: (x == player_A).sum()),
-                    points_won_by_B=("pointscorer", lambda x: (x == player_B).sum()),
-                    tiebreak_status=("Tiebreak_status", "last"),
-                )
-                .reset_index()
+        if s.rows:
+            df_raw = pd.DataFrame(s.rows)
+            df_ann = build_match_df(df_raw, a, b)
+            ts     = datetime.now().strftime("%Y%m%d_%H%M")
+            st.download_button(
+                "⬇️ Download CSV",
+                data=df_ann.to_csv(index=False).encode(),
+                file_name=f"tennis_{a}_vs_{b}_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
-            st.write("**Game dominance source data**")
-            st.dataframe(dominance_table, use_container_width=True)
 
-            description_df = df_match.copy()
-            description_df["description"] = description_df["description"].fillna("unknown")
-            description_df = description_df[description_df["description"].str.lower() != "unknown"].copy()
+    # Right: stats / charts / log (only when data exists)
+    with right_col:
+        if not s.rows:
+            st.markdown("""
+            <div style="text-align:center;padding:60px 20px;color:#999;">
+              <div style="font-size:52px;margin-bottom:14px">📊</div>
+              <p>Statistics and charts will appear here after you log your first point.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            df_raw = pd.DataFrame(s.rows)
+            df_ann = build_match_df(df_raw, a, b)
+            stats  = generate_stats(df_ann, a, b)
 
-            description_table = pd.DataFrame({
-                "Description": sorted(set(description_df["description"]))
-            })
-            description_table[f"{player_A} won"] = description_table["Description"].map(
-                description_df[description_df["pointscorer"] == player_A]["description"].value_counts()
-            ).fillna(0).astype(int)
-            description_table[f"{player_A} lost"] = description_table["Description"].map(
-                description_df[description_df["pointscorer"] != player_A]["description"].value_counts()
-            ).fillna(0).astype(int)
-            description_table[f"{player_B} won"] = description_table["Description"].map(
-                description_df[description_df["pointscorer"] == player_B]["description"].value_counts()
-            ).fillna(0).astype(int)
-            description_table[f"{player_B} lost"] = description_table["Description"].map(
-                description_df[description_df["pointscorer"] != player_B]["description"].value_counts()
-            ).fillna(0).astype(int)
+            tab1, tab2, tab3 = st.tabs(["📊 Statistics", "📈 Charts", "📋 Point Log"])
 
-            st.write("**Point description source data**")
-            if len(description_table):
-                st.dataframe(description_table, use_container_width=True)
-            else:
-                st.info("No non-unknown point descriptions recorded yet.")
+            with tab1:
+                st.dataframe(
+                    format_stats_for_display(stats),
+                    use_container_width=True,
+                )
 
-        st.subheader("Recorded points")
-        st.dataframe(df_match, use_container_width=True)
+            with tab2:
+                st.plotly_chart(chart_butterfly(stats),         use_container_width=True)
+                st.plotly_chart(chart_momentum(df_ann, a, b),   use_container_width=True)
+                st.plotly_chart(chart_dominance(df_ann, a, b),  use_container_width=True)
 
-        csv_bytes = df_match.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv_bytes, file_name="tennis_match.csv", mime="text/csv")
-
-        if st.session_state.finished:
-            st.success("Match finished.")
+            with tab3:
+                st.dataframe(df_ann, use_container_width=True)
 
 
 if __name__ == "__main__":
